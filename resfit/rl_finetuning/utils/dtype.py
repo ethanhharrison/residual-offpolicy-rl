@@ -6,6 +6,34 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+
+def maybe_resize_rl_images(obs_dict: dict, keys: list[str], size: int | None) -> None:
+    """Downsample RL camera observations to size x size in-place."""
+    if size is None:
+        return
+
+    for key in keys:
+        if key not in obs_dict:
+            continue
+        value = obs_dict[key]
+        if isinstance(value, np.ndarray):
+            tensor = torch.from_numpy(value).float()
+            if tensor.dim() == 3:
+                tensor = tensor.unsqueeze(0)
+            if tensor.shape[-2] == size and tensor.shape[-1] == size:
+                continue
+            resized = F.interpolate(tensor, size=(size, size), mode="bilinear", align_corners=False)
+            obs_dict[key] = resized.squeeze(0).numpy()
+        elif isinstance(value, torch.Tensor):
+            tensor = value.float()
+            if tensor.dim() == 3:
+                tensor = tensor.unsqueeze(0)
+            if tensor.shape[-2] == size and tensor.shape[-1] == size:
+                continue
+            resized = F.interpolate(tensor, size=(size, size), mode="bilinear", align_corners=False)
+            obs_dict[key] = resized.squeeze(0)
 
 
 def to_uint8(obs_dict: dict, keys: list[str]):

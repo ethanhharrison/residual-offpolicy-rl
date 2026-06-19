@@ -8,6 +8,7 @@ import copy
 from contextlib import contextmanager
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from resfit.rl_finetuning.config.rlpd import QAgentConfig
@@ -230,6 +231,17 @@ class QAgent(nn.Module):
             if augment:
                 data = self.aug(data)
 
+            _, enc_h, enc_w = self.encoders[cam_idx].obs_shape
+            if data.dim() == 3:
+                data = data.unsqueeze(0)
+                squeeze_batch = True
+            else:
+                squeeze_batch = False
+            if data.shape[-2] != enc_h or data.shape[-1] != enc_w:
+                data = F.interpolate(data, size=(enc_h, enc_w), mode="bilinear", align_corners=False)
+            if squeeze_batch:
+                data = data.squeeze(0)
+
             # Forward pass through the *corresponding* encoder
             feat_cam = self.encoders[cam_idx].forward(data, flatten=False)
             feats.append(feat_cam)
@@ -250,14 +262,27 @@ class QAgent(nn.Module):
 
     def act(self, obs: dict[str, torch.Tensor], *, eval_mode=False, stddev=0.0, cpu=True) -> torch.Tensor:
         """This function takes tensor and returns actions in tensor"""
+        action, _ = self.act_and_q_value(obs, eval_mode=eval_mode, stddev=stddev, cpu=cpu, compute_q=False)
+        return action
+
+    def act_and_q_value(
+        self,
+        obs: dict[str, torch.Tensor],
+        *,
+        eval_mode=False,
+        stddev=0.0,
+        cpu=True,
+        compute_q: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the actor once and optionally compute critic Q-values from the same features."""
         assert not self.training
         assert not self.actor.training
-        # Make a shallow copy of the observation dict
         obs = copy.copy(obs)
         unsqueezed = self._maybe_unsqueeze_(obs)
 
         assert "feat" not in obs
-        obs["feat"] = self._encode(obs, augment=False)
+        feat = self._encode(obs, augment=False)
+        obs["feat"] = feat
 
         action = self._act_default(
             obs=obs,
@@ -267,13 +292,24 @@ class QAgent(nn.Module):
             use_target=False,
         )
 
+        q_value = None
+        if compute_q:
+            q_actions = action
+            if self.residual_actor:
+                q_actions = torch.clamp(obs["observation.base_action"] + action, -1.0, 1.0)
+            q_value = self.critic.q_value(feat, obs["observation.state"], q_actions).squeeze(-1)
+
         if unsqueezed:
             action = action.squeeze(0)
+            if q_value is not None:
+                q_value = q_value.squeeze(0)
 
         action = action.detach()
         if cpu:
             action = action.cpu()
-        return action
+        if q_value is not None:
+            q_value = q_value.detach().cpu()
+        return action, q_value
 
     def _act_default(
         self,

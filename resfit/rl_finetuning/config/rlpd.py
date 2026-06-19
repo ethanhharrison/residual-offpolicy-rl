@@ -213,7 +213,10 @@ class RLPDAlgoConfig:
     stddev_schedule: str = field(init=False)
 
     def __post_init__(self):
-        self.stddev_schedule = f"linear({self.stddev_max},{self.stddev_min},{self.stddev_step})"
+        self.stddev_schedule = build_stddev_schedule(self.stddev_max, self.stddev_min, self.stddev_step)
+
+def build_stddev_schedule(stddev_max: float, stddev_min: float, stddev_step: int) -> str:
+    return f"linear({stddev_max},{stddev_min},{stddev_step})"
 
 
 # -----------------------------------------------------------------------------

@@ -16,8 +16,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from resfit.dexmg.environments.dexmg import VectorizedEnvWrapper
-from resfit.lerobot.policies.act.modeling_act import ACTPolicy
+from resfit.lerobot.policies.pretrained import PreTrainedPolicy
 
 
 class BasePolicyVecEnvWrapper:
@@ -36,17 +35,19 @@ class BasePolicyVecEnvWrapper:
 
     def __init__(
         self,
-        vec_env: VectorizedEnvWrapper,
-        base_policy: ACTPolicy,
+        vec_env,
+        base_policy: PreTrainedPolicy,
         action_scaler,
         state_standardizer,
+        language_instruction: str | None = None,
     ):
         """
         Args:
             vec_env: Vectorized environment from create_vectorized_env
-            base_policy: Base policy (e.g., ACTPolicy) to augment with residual actions
+            base_policy: Base policy (e.g., ACTPolicy or OpenPIPi0AlohaSimPolicy)
             action_scaler: ActionScaler object for scaling/unscaling actions (REQUIRED)
             state_standardizer: StateStandardizer object for standardizing states (REQUIRED)
+            language_instruction: Task prompt for language-conditioned base policies (pi0).
         """
         assert action_scaler is not None, "action_scaler is required for consistent normalization"
         assert state_standardizer is not None, "state_standardizer is required for consistent normalization"
@@ -55,6 +56,8 @@ class BasePolicyVecEnvWrapper:
         self.base_policy = base_policy
         self.action_scaler = action_scaler
         self.state_standardizer = state_standardizer
+        self.language_instruction = language_instruction
+        self.requires_language = getattr(base_policy.config, "type", "") == "pi0"
 
         # Get action dimension from the environment
         self.action_dim = vec_env.action_space.shape[-1]
@@ -89,6 +92,26 @@ class BasePolicyVecEnvWrapper:
 
         self.observation_space = gym.spaces.Dict(obs_spaces)
 
+    def _prepare_base_policy_obs(self, raw_obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if not self.requires_language:
+            return raw_obs
+        obs = raw_obs.copy()
+        batch_size = next(iter(obs.values())).shape[0]
+        obs["task"] = [self.language_instruction] * batch_size
+        return obs
+
+    def _maybe_attach_base_policy_images(self, raw_obs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Attach full-resolution camera frames only when pi0 must re-infer."""
+        obs = self._prepare_base_policy_obs(raw_obs)
+        needs_infer = getattr(self.base_policy, "needs_inference", None)
+        if needs_infer is None or not needs_infer(obs):
+            return obs
+
+        image_key = self.image_keys[0]
+        if hasattr(self.vec_env, "render_base_policy_images"):
+            obs[image_key] = self.vec_env.render_base_policy_images()
+        return obs
+
     def reset(self, **kwargs) -> tuple[dict[str, torch.Tensor], dict]:
         """Reset environment and base policy."""
         # Reset the underlying vectorized environment
@@ -99,7 +122,7 @@ class BasePolicyVecEnvWrapper:
 
         # Get base action from the base policy
         with torch.no_grad():
-            base_action = self.base_policy.select_action(raw_obs)
+            base_action = self.base_policy.select_action(self._maybe_attach_base_policy_images(raw_obs))
 
         base_naction = self.action_scaler.scale(base_action)
 
@@ -144,16 +167,18 @@ class BasePolicyVecEnvWrapper:
         # Store the scaled action for replay buffer (already computed above)
         info["scaled_action"] = combined_naction
 
-        # Get next base action from the base policy
+        # Clear stale action chunks before querying the base policy. With vector-env
+        # autoreset, raw_obs is already the *next* episode's first observation when
+        # done=True. Aloha marks failures as truncated-only, so we must reset on both.
+        done = terminated | truncated
+        if done.any():
+            self.base_policy.reset(env_ids=torch.where(done)[0])
+
+        # Get next base action for the returned observation (fresh chunk after reset).
         with torch.no_grad():
-            base_action = self.base_policy.select_action(raw_obs)
+            base_action = self.base_policy.select_action(self._maybe_attach_base_policy_images(raw_obs))
 
         base_naction = self.action_scaler.scale(base_action)
-
-        # Handle policy reset for terminated environments
-        if terminated.any():
-            reset_ids = torch.where(terminated)[0]
-            self.base_policy.reset(env_ids=reset_ids)
 
         # Augment observations with base action and apply state standardization
         augmented_obs = self._augment_obs(raw_obs, base_naction)

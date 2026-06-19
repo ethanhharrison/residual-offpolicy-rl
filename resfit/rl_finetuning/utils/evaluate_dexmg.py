@@ -126,7 +126,8 @@ def run_dexmg_evaluation(
         box_data = [q_values_at_progress[f"{int(p * 100)}%"] for p in progress_points]
         box_labels = [f"{int(p * 100)}%" for p in progress_points]
 
-        ax2.boxplot(box_data, labels=box_labels)
+        ax2.boxplot(box_data)
+        ax2.set_xticklabels(box_labels)
         ax2.set_xlabel("Episode Progress")
         ax2.set_ylabel("Q-Value")
         ax2.set_title("Q-Value Distribution at Different Episode Progress Points")
@@ -173,19 +174,10 @@ def run_dexmg_evaluation(
         # 1. Policy inference + Q-value prediction ---------------------
         # --------------------------------------------------------------
         with torch.no_grad():
-            actions = q_actions = agent.act(obs, eval_mode=True, stddev=0.0, cpu=False)
-
-            # Build features on-the-fly to obtain Q-predictions --------
-            obs_q = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in obs.items()}
-            obs_q["feat"] = agent._encode(obs_q, augment=False)
-
-            # For Q-value computation, use combined action and clamp to [-1, 1] (consistent with training)
-            if agent.residual_actor:
-                q_actions = torch.clamp(obs["observation.base_action"] + actions, -1.0, 1.0)
-
-            q_pred = (
-                agent.critic.q_value(obs_q["feat"], obs_q["observation.state"], q_actions).detach().cpu().squeeze(-1)
+            actions, q_pred = agent.act_and_q_value(
+                obs, eval_mode=True, stddev=0.0, cpu=False, compute_q=True
             )
+            assert q_pred is not None
 
         # --------------------------------------------------------------
         # 2. Environment step ------------------------------------------

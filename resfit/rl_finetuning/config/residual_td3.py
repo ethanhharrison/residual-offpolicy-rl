@@ -35,9 +35,14 @@ class WandBConfig:
 
 @dataclass
 class BasePolicyConfig:
+    # "act" loads from W&B; "pi0" loads from OpenPI's public S3 checkpoints.
+    type: str = "act"
     wandb_id: str = "TODO"
     wt_type: str = "best"
     wt_version: str = "latest"
+    openpi_config_name: str = "pi0_aloha_sim"
+    openpi_checkpoint: str = "s3://openpi-assets/checkpoints/pi0_aloha_sim"
+    language_instruction: str | None = None
 
 
 @dataclass
@@ -61,6 +66,14 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # False: residual_action = pure_random - base_action (resulting in pure_random)
     use_base_policy_for_warmup: bool = True
 
+    # When True (and use_base_policy_for_warmup), collect pure base-policy rollouts
+    # (zero residual) during warmup instead of base + random_action_noise_scale.
+    warmup_pure_base_policy: bool = False
+
+    # Keep collecting warmup episodes until at least this many successes are logged,
+    # even if learning_starts transitions are already in the buffer.
+    warmup_min_success_episodes: int = 0
+
     # ------------------------------------------------------------------
     # Standard deviation schedule -------------------------------------------
     # ------------------------------------------------------------------
@@ -79,6 +92,8 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
 @dataclass
 class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     actor_name: str | None = None  # Inferred from base policy config
+    env_type: str = "dexmg"  # "dexmg" or "aloha"
+    camera_size: int | None = None
 
     # ------------------------------------------------------------------
     # Algorithm & optimisation
@@ -264,6 +279,64 @@ class ResidualTD3TwoArmCanSortConfig(ResidualTD3BoxCleanConfig):
     )
 
 
+@dataclass
+class ResidualTD3AlohaTransferCubeConfig(ResidualTD3DexmgConfig):
+    env_type: str = "aloha"
+    task: str = "AlohaTransferCube"
+
+    video_key: str = "observation.images.top"
+    rl_camera: list[str] = field(default_factory=lambda: ["observation.images.top"])
+    camera_size: int = 84
+
+    algo: ResidualTD3AlgoConfig = field(
+        default_factory=lambda: ResidualTD3AlgoConfig(
+            total_timesteps=300_000,
+            critic_warmup_steps=10_000,
+            random_action_noise_scale=0.2,
+            use_base_policy_for_warmup=True,
+            warmup_pure_base_policy=True,
+            warmup_min_success_episodes=1,
+            stddev_max=0.05,
+            stddev_min=0.05,
+        )
+    )
+
+    agent: QAgentConfig = field(
+        default_factory=lambda: QAgentConfig(
+            actor_lr=1e-6,
+            critic_lr=1e-4,
+            critic_target_tau=0.005,
+            actor=ActorConfig(
+                action_scale=0.1,
+                actor_last_layer_init_scale=0.0,
+            ),
+        )
+    )
+
+    offline_data: OfflineDataConfig = field(
+        default_factory=lambda: OfflineDataConfig(
+            name="lerobot/aloha_sim_transfer_cube_human",
+            num_episodes=50,
+        )
+    )
+
+    base_policy: BasePolicyConfig = field(
+        default_factory=lambda: BasePolicyConfig(
+            type="pi0",
+            openpi_config_name="pi0_aloha_sim",
+            openpi_checkpoint="s3://openpi-assets/checkpoints/pi0_aloha_sim",
+            language_instruction="Transfer cube",
+        )
+    )
+
+    wandb: WandBConfig = field(
+        default_factory=lambda: WandBConfig(project="aloha-transfer-cube-residual-td3")
+    )
+
+    eval_num_envs: int = 1
+    eval_num_episodes: int = 10
+
+
 # -----------------------------------------------------------------------------
 # Register with Hydra
 # -----------------------------------------------------------------------------
@@ -274,3 +347,4 @@ cs.store(name="residual_td3_square_config", node=ResidualTD3SquareConfig)
 cs.store(name="residual_td3_box_clean_config", node=ResidualTD3BoxCleanConfig)
 cs.store(name="residual_td3_coffee_config", node=ResidualTD3CoffeeConfig)
 cs.store(name="residual_td3_two_arm_cansort_config", node=ResidualTD3TwoArmCanSortConfig)
+cs.store(name="residual_td3_aloha_transfer_cube_config", node=ResidualTD3AlohaTransferCubeConfig)

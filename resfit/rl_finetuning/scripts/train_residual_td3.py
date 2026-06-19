@@ -41,14 +41,16 @@ from torchrl.data import LazyTensorStorage, ReplayBuffer, TensorDictPrioritizedR
 from tqdm import tqdm
 
 import wandb
-from resfit.dexmg.environments.dexmg import create_vectorized_env
+from resfit.lerobot.policies.pi0.configuration_pi0 import PI0Config
 from resfit.lerobot.policies.act.configuration_act import ACTConfig
-from resfit.lerobot.policies.act.modeling_act import ACTPolicy
-from resfit.lerobot.utils.load_policy import download_policy_from_wandb, load_policy
+from resfit.lerobot.policies.pretrained import PreTrainedPolicy
+from resfit.lerobot.utils.load_policy import load_base_policy
 from resfit.rl_finetuning.config.residual_td3 import ResidualTD3DexmgConfig
+from resfit.rl_finetuning.config.rlpd import build_stddev_schedule
 from resfit.rl_finetuning.off_policy.common_utils import utils
 from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
-from resfit.rl_finetuning.utils.dtype import to_uint8
+from resfit.rl_finetuning.utils.dtype import maybe_resize_rl_images, to_uint8
+from resfit.rl_finetuning.utils.env_factory import create_vectorized_env
 from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
 from resfit.rl_finetuning.utils.hugging_face import (
     _hf_download_buffer,
@@ -144,6 +146,16 @@ if "MUJOCO_EGL_DEVICE_ID" in os.environ:
     del os.environ["MUJOCO_EGL_DEVICE_ID"]
 
 
+def _resolve_video_backend() -> str:
+    """Use torchcodec when its native libs load; otherwise fall back to pyav."""
+    try:
+        from torchcodec.decoders import VideoDecoder  # noqa: F401
+    except Exception:
+        print("torchcodec unavailable (missing FFmpeg or incompatible build); using pyav for dataset videos.")
+        return "pyav"
+    return "torchcodec"
+
+
 def _add_transitions_to_buffer(
     *,
     obs: dict,
@@ -157,6 +169,7 @@ def _add_transitions_to_buffer(
     lowdim_keys: list[str],
     num_envs: int,
     online_rb: TensorDictPrioritizedReplayBuffer,
+    rl_image_size: int | None = None,
 ) -> None:
     """Helper function to create transitions and add them to the replay buffer.
 
@@ -176,6 +189,8 @@ def _add_transitions_to_buffer(
         # Keep only relevant keys & convert images to uint8 for storage
         curr_obs_i = {k: v for k, v in curr_obs_i.items() if k in obs_keys_set}
         next_obs_i = {k: v for k, v in next_obs_i.items() if k in obs_keys_set}
+        maybe_resize_rl_images(curr_obs_i, image_keys, rl_image_size)
+        maybe_resize_rl_images(next_obs_i, image_keys, rl_image_size)
         to_uint8(curr_obs_i, image_keys)
         to_uint8(next_obs_i, image_keys)
 
@@ -217,17 +232,31 @@ def main(cfg: ResidualTD3DexmgConfig):
     # for residual learning.
     # ---------------------------------------------------------------------
     assert "base_policy" in cfg, "Base policy configuration is required"
-    policy_dir, _ = download_policy_from_wandb(
-        cfg.base_policy.wandb_id,
-        step=cfg.base_policy.wt_type,
-        artifact_version=cfg.base_policy.wt_version,
+    base_policy: PreTrainedPolicy = load_base_policy(
+        policy_type=cfg.base_policy.type,
+        device=device,
+        wandb_id=cfg.base_policy.wandb_id,
+        wt_type=cfg.base_policy.wt_type,
+        wt_version=cfg.base_policy.wt_version,
+        openpi_config_name=cfg.base_policy.openpi_config_name,
+        openpi_checkpoint=cfg.base_policy.openpi_checkpoint,
     )
-
-    base_policy: ACTPolicy = load_policy(policy_dir)
-    base_policy.to(device)
     base_policy.eval()
-    eval_base_policy: ACTPolicy = load_policy(policy_dir)
-    eval_base_policy.to(device)
+    if cfg.base_policy.type == "pi0":
+        # Reuse the loaded OpenPI model but keep a separate action-chunk queue for eval.
+        from resfit.lerobot.policies.pi0.modeling_openpi_pi0_aloha_sim import OpenPIPi0AlohaSimPolicy
+        eval_base_policy = OpenPIPi0AlohaSimPolicy(base_policy._openpi_policy, base_policy.config)
+        eval_base_policy.to(device)
+    else:
+        eval_base_policy = load_base_policy(
+            policy_type=cfg.base_policy.type,
+            device=device,
+            wandb_id=cfg.base_policy.wandb_id,
+            wt_type=cfg.base_policy.wt_type,
+            wt_version=cfg.base_policy.wt_version,
+            openpi_config_name=cfg.base_policy.openpi_config_name,
+            openpi_checkpoint=cfg.base_policy.openpi_checkpoint,
+        )
     eval_base_policy.eval()
 
     # Extract the configuration from base policy
@@ -235,12 +264,18 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     if isinstance(base_cfg, ACTConfig):
         cfg.actor_name = "residual_act"
+    elif isinstance(base_cfg, PI0Config):
+        cfg.actor_name = "residual_pi0"
     else:
         raise ValueError(f"Unknown base policy type: {type(base_cfg)}")
 
+    language_instruction = cfg.base_policy.language_instruction
+    if cfg.base_policy.type == "pi0" and not language_instruction:
+        raise ValueError("base_policy.language_instruction is required when base_policy.type='pi0'")
+
     # Load dataset and get normalization functions early
     print("Loading dataset and setting up normalization...")
-    dataset = LeRobotDataset(cfg.offline_data.name)
+    dataset = LeRobotDataset(cfg.offline_data.name, video_backend=_resolve_video_backend())
 
     # Create action scaler from dataset statistics
     action_scaler = ActionScaler.from_dataset_stats(
@@ -260,7 +295,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     def get_envs(
         env_name: str,
         num_envs: int,
-        base_policy: ACTPolicy,
+        base_policy: PreTrainedPolicy,
         device: str,
         video_key: str,
         debug: bool,
@@ -272,9 +307,11 @@ def main(cfg: ResidualTD3DexmgConfig):
 
         # Create the vectorized environment
         vec_env = create_vectorized_env(
+            env_type=cfg.env_type,
             env_name=env_name,
             num_envs=num_envs,
             device=device,
+            camera_size=cfg.camera_size,
             video_key=video_key,
             debug=debug,
         )
@@ -285,6 +322,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             base_policy=base_policy,
             action_scaler=action_scaler,
             state_standardizer=state_standardizer,
+            language_instruction=language_instruction,
         )
 
     # ---------------------------------------------------------------------
@@ -359,11 +397,19 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     lowdim_keys = ["observation.state", "observation.base_action"]
 
+    # ViT encoder expects 84x84; Aloha Sim renders 480x640 for the pi0 base policy.
+    rl_image_size = cfg.camera_size or 84
+    if img_h != rl_image_size or img_w != rl_image_size:
+        print(
+            f"RL encoder uses {rl_image_size}x{rl_image_size} images "
+            f"(env camera: {img_h}x{img_w}, base policy keeps full resolution)"
+        )
+
     # ---------------------------------------------------------------------
     # Networks ------------------------------------------------------------
     # ---------------------------------------------------------------------
     agent = QAgent(
-        obs_shape=(img_c, img_h, img_w),
+        obs_shape=(img_c, rl_image_size, rl_image_size),
         prop_shape=(lowdim_dim,),
         action_dim=action_dim,
         rl_cameras=image_keys,
@@ -415,6 +461,7 @@ def main(cfg: ResidualTD3DexmgConfig):
     online_cache_meta = {
         "task": cfg.task,
         "image_keys": image_keys,
+        "camera_size": cfg.camera_size,
         "n_step": cfg.algo.n_step,
         "gamma": cfg.algo.gamma,
         "horizon": horizon,
@@ -424,6 +471,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         "batch_size": online_batch_size,
         # Include random action noise scale to prevent mixing data from different noise levels
         "random_action_noise_scale": cfg.algo.random_action_noise_scale,
+        "use_base_policy_for_warmup": cfg.algo.use_base_policy_for_warmup,
+        "warmup_pure_base_policy": cfg.algo.warmup_pure_base_policy,
+        "warmup_min_success_episodes": cfg.algo.warmup_min_success_episodes,
         # Normalization parameters for consistency
         "min_action_range": cfg.offline_data.min_action_range,
         "min_state_std": cfg.offline_data.min_state_std,
@@ -516,7 +566,9 @@ def main(cfg: ResidualTD3DexmgConfig):
         image_keys: list[str],
         num_episodes: int | None = None,
         use_base_policy_for_base_actions: bool = False,
-        base_policy: ACTPolicy | None = None,
+        base_policy: PreTrainedPolicy | None = None,
+        language_instruction: str | None = None,
+        base_policy_requires_language: bool = False,
     ) -> int:
         """
         Iterates through *dataset* sequentially, converts consecutive frames
@@ -566,6 +618,15 @@ def main(cfg: ResidualTD3DexmgConfig):
                     if "observation" in k:
                         raw_obs[k] = sample[k].to(device)  # Keep batch dimension for base policy
 
+                if ep_idx not in episode_cache:
+                    base_policy.reset()
+
+                if base_policy_requires_language:
+                    if "task" in sample:
+                        raw_obs["task"] = sample["task"]
+                    elif language_instruction:
+                        raw_obs["task"] = [language_instruction]
+
                 # Get base action from base policy
                 with torch.no_grad():
                     base_action = base_policy.select_action(raw_obs)
@@ -582,6 +643,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             for k in image_keys:
                 curr_obs[k] = sample[k].squeeze(0)
 
+            maybe_resize_rl_images(curr_obs, image_keys, rl_image_size)
             # Convert images to uint8 for memory-efficient storage
             to_uint8(curr_obs, image_keys)
 
@@ -642,9 +704,13 @@ def main(cfg: ResidualTD3DexmgConfig):
         "min_action_range": cfg.offline_data.min_action_range,
         "min_state_std": cfg.offline_data.min_state_std,
         "image_keys": image_keys,
+        "camera_size": cfg.camera_size,
         "n_step": cfg.algo.n_step,
         "gamma": cfg.algo.gamma,
+        "base_policy_type": cfg.base_policy.type,
         "base_policy_wandb_id": cfg.base_policy.wandb_id,
+        "base_policy_openpi_checkpoint": cfg.base_policy.openpi_checkpoint,
+        "base_policy_language_instruction": cfg.base_policy.language_instruction,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "normalized_actions": True,
         "batch_size": offline_batch_size,
@@ -693,6 +759,8 @@ def main(cfg: ResidualTD3DexmgConfig):
                 num_episodes=cfg.offline_data.num_episodes,
                 use_base_policy_for_base_actions=cfg.offline_data.use_base_policy_for_base_actions,
                 base_policy=base_policy if cfg.offline_data.use_base_policy_for_base_actions else None,
+                language_instruction=language_instruction,
+                base_policy_requires_language=cfg.base_policy.type == "pi0",
             )
 
             print(f"Added {added} offline transitions to buffer (size={len(offline_rb)})")
@@ -712,11 +780,21 @@ def main(cfg: ResidualTD3DexmgConfig):
         print("Skipping offline buffer population for online-only training")
 
     # ------------------------------------------------------------------
-    # Warm-up phase (random policy) --------------------------------------
+    # Warm-up phase (base policy rollouts) -----------------------------
     # ------------------------------------------------------------------
 
     if len(online_rb) < cfg.algo.learning_starts and not loaded_online_from_cache:
-        print(f"Warm-up: filling online buffer with {cfg.algo.learning_starts - len(online_rb)} random steps…")
+        if cfg.algo.use_base_policy_for_warmup and cfg.algo.warmup_pure_base_policy:
+            warmup_mode = "pure base policy (zero residual)"
+        elif cfg.algo.use_base_policy_for_warmup:
+            warmup_mode = f"base policy + noise (scale={cfg.algo.random_action_noise_scale})"
+        else:
+            warmup_mode = f"uniform random (scale={cfg.algo.random_action_noise_scale})"
+        print(
+            f"Warm-up: collecting online buffer transitions via {warmup_mode}. "
+            f"Target size={cfg.algo.learning_starts}, "
+            f"min_success_episodes={cfg.algo.warmup_min_success_episodes}."
+        )
         obs, _ = env.reset()
         # --------------------------------------------------------------
         # Logging helper: print progress every 1 000 collected transitions
@@ -725,20 +803,26 @@ def main(cfg: ResidualTD3DexmgConfig):
 
         reward_sum = 0
         episode_count = 0
+        success_episodes = 0
 
-        while len(online_rb) < cfg.algo.learning_starts:
+        def _warmup_targets_met() -> bool:
+            if len(online_rb) < cfg.algo.learning_starts:
+                return False
+            return success_episodes >= cfg.algo.warmup_min_success_episodes
+
+        while not _warmup_targets_met():
             if cfg.algo.use_base_policy_for_warmup:
-                # Use base policy action + noise (residual exploration)
-                # Since the environment wrapper always adds base_action to residual_action,
-                # we just need to provide the noise as the residual action
-                rand_actions = (
-                    torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
-                ) * cfg.algo.random_action_noise_scale
+                if cfg.algo.warmup_pure_base_policy:
+                    # Execute the base policy exactly: combined = base + 0.
+                    rand_actions = torch.zeros((cfg.num_envs, action_dim), device=device)
+                else:
+                    # Base policy action + noise (residual exploration)
+                    rand_actions = (
+                        torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
+                    ) * cfg.algo.random_action_noise_scale
             else:
                 # Pure uniform random actions - need to cancel out the base policy action
-                # Since env does: combined = base_action + residual_action
-                # To get pure random: residual_action = random - base_action
-                base_action = obs["observation.base_action"]  # Already normalized to [-1, 1]
+                base_action = obs["observation.base_action"]
                 pure_random = (
                     torch.rand((cfg.num_envs, action_dim), device=device) * 2 - 1
                 ) * cfg.algo.random_action_noise_scale
@@ -748,7 +832,9 @@ def main(cfg: ResidualTD3DexmgConfig):
             done = terminated | truncated
 
             reward_sum += reward.sum().item()
-            episode_count += done.float().sum().item()
+            if done.any():
+                episode_count += done.float().sum().item()
+                success_episodes += (reward[done] > 0.0).sum().item()
 
             # Use the executed combined action returned by the environment
             combined_action = info["scaled_action"]
@@ -764,21 +850,24 @@ def main(cfg: ResidualTD3DexmgConfig):
                 lowdim_keys=lowdim_keys,
                 num_envs=cfg.num_envs,
                 online_rb=online_rb,
+                rl_image_size=rl_image_size,
             )
 
             # ----------------------------------------------------------
             # Progress logging (every ~1 000 transitions) --------------
             # ----------------------------------------------------------
             if len(online_rb) >= next_log_threshold:
-                success_rate = reward_sum / episode_count if episode_count > 0 else 0.0
+                success_rate = success_episodes / episode_count if episode_count > 0 else 0.0
                 print(
                     f"[Warm-up] {len(online_rb)} / {cfg.algo.learning_starts} "
-                    f"transitions collected, reward_sum={reward_sum:.2f}, "
-                    f"success_rate={success_rate:.3f} ({reward_sum}/{episode_count})"
+                    f"transitions collected, success_episodes={success_episodes}, "
+                    f"success_rate={success_rate:.3f} ({success_episodes}/{episode_count})"
                 )
                 next_log_threshold += 1000
 
             obs = next_obs  # roll state
+
+        online_cache_meta["warmup_success_episodes"] = success_episodes
 
         # Persist freshly-collected buffer (local + HF) --------------------
         online_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -787,7 +876,10 @@ def main(cfg: ResidualTD3DexmgConfig):
             json.dump(online_cache_meta, f, indent=2)
         if ONLINE_HF_REPO is not None:
             _hf_upload_buffer(ONLINE_HF_REPO, online_cache_dir, online_cache_hash)
-        print(f"Warm-up done. Online buffer size = {len(online_rb)} transitions")
+        print(
+            f"Warm-up done. Online buffer size = {len(online_rb)} transitions, "
+            f"success_episodes={success_episodes}."
+        )
 
         loaded_online_from_cache = True  # treat as cached going forward
 
@@ -988,6 +1080,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             lowdim_keys=lowdim_keys,
             num_envs=cfg.num_envs,
             online_rb=online_rb,
+            rl_image_size=rl_image_size,
         )
 
         obs = next_obs  # roll
@@ -1191,6 +1284,11 @@ def main(cfg: ResidualTD3DexmgConfig):
 # -----------------------------------------------------------------------------
 @hydra.main(version_base=None, config_name="residual_td3_dexmg_config")
 def hydra_entry(cfg: ResidualTD3DexmgConfig):
+    # stddev_schedule is set in RLPDAlgoConfig.__post_init__ before Hydra CLI overrides
+    # are applied, so recompute it here after overrides to stddev_max/min/step.
+    cfg.algo.stddev_schedule = build_stddev_schedule(
+        cfg.algo.stddev_max, cfg.algo.stddev_min, cfg.algo.stddev_step
+    )
     cfg_conf = OmegaConf.structured(cfg)
     main(cfg_conf)
 

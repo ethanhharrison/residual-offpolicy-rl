@@ -37,7 +37,7 @@ from tqdm import tqdm
 
 import wandb
 from resfit.dexmg.environments.dexmg import create_vectorized_env
-from resfit.rl_finetuning.config.rlpd import RLPDDexmgConfig
+from resfit.rl_finetuning.config.rlpd import RLPDDexmgConfig, build_stddev_schedule
 from resfit.rl_finetuning.off_policy.common_utils import utils
 from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
 from resfit.rl_finetuning.utils.checkpoint import save_checkpoint
@@ -807,6 +807,7 @@ def main(cfg: RLPDDexmgConfig):
 # -----------------------------------------------------------------------------
 @hydra.main(version_base=None, config_name="rlpd_dexmg_config")
 def hydra_entry(cfg: RLPDDexmgConfig):
+    cfg.algo.stddev_schedule = build_stddev_schedule(cfg.algo.stddev_max, cfg.algo.stddev_min, cfg.algo.stddev_step)
     cfg_conf = OmegaConf.structured(cfg)
     main(cfg_conf)
 
