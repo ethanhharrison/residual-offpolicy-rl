@@ -23,6 +23,20 @@ class VitEncoderConfig:
 
 
 @dataclass
+class ConvEncoderConfig:
+    channels: list[int] = field(default_factory=lambda: [32, 32, 32, 32])
+    kernel_size: int = 3
+    strides: list[int] = field(default_factory=lambda: [2, 1, 1, 1])
+
+    def __post_init__(self):
+        if len(self.strides) == 1:
+            self.strides = self.strides * len(self.channels)
+        assert len(self.strides) == len(self.channels), (
+            f"strides length ({len(self.strides)}) must match channels length ({len(self.channels)})"
+        )
+
+
+@dataclass
 class CriticLossCfg:
     type: str = "mse"
     n_bins: int = 51  # 0.995 γ → δ=0.005  # noqa: RUF003
@@ -105,8 +119,9 @@ class QAgentConfig:
     lr_warmup_start: float = 1e-8  # Starting LR for warmup (very small positive value)
     # encoder
     use_prop: int = 1
-    enc_type: str = "vit"
+    enc_type: str = "vit"  # "vit" or "conv"
     vit: VitEncoderConfig = field(default_factory=lambda: VitEncoderConfig())
+    conv: ConvEncoderConfig = field(default_factory=lambda: ConvEncoderConfig())
     # critic & actor
     critic: CriticConfig = field(default_factory=lambda: CriticConfig())
     actor: ActorConfig = field(default_factory=lambda: ActorConfig())
@@ -129,7 +144,7 @@ class QAgentConfig:
     target_action_noise: bool = True  # Whether to add noise to target actions in TD3
 
     def __post_init__(self):
-        pass
+        assert self.enc_type in {"vit", "conv"}, f"Unknown encoder type: {self.enc_type}"
 
 
 # -----------------------------------------------------------------------------

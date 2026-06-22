@@ -14,7 +14,7 @@ from torch import nn
 from resfit.rl_finetuning.config.rlpd import QAgentConfig
 from resfit.rl_finetuning.off_policy import common_utils
 from resfit.rl_finetuning.off_policy.common_utils import utils
-from resfit.rl_finetuning.off_policy.networks.encoder import VitEncoder
+from resfit.rl_finetuning.off_policy.networks.encoder import ConvEncoder, VitEncoder
 from resfit.rl_finetuning.off_policy.rl.actor import Actor
 from resfit.rl_finetuning.off_policy.rl.critic import Critic
 
@@ -164,6 +164,8 @@ class QAgent(nn.Module):
         for _ in self.rl_cameras:
             if self.cfg.enc_type == "vit":
                 enc = VitEncoder(obs_shape, self.cfg.vit).to(self.cfg.device)
+            elif self.cfg.enc_type == "conv":
+                enc = ConvEncoder(obs_shape, self.cfg.conv).to(self.cfg.device)
             else:
                 raise AssertionError(f"Unknown encoder type {self.cfg.enc_type}.")
 
