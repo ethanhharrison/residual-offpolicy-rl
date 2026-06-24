@@ -43,6 +43,8 @@ class BasePolicyConfig:
     openpi_config_name: str = "pi0_aloha_sim"
     openpi_checkpoint: str = "s3://openpi-assets/checkpoints/pi0_aloha_sim"
     language_instruction: str | None = None
+    inference_delay: int = 0
+    n_action_steps: int | None = None
 
 
 @dataclass

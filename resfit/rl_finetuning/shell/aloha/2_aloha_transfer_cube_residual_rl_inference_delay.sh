@@ -1,5 +1,5 @@
 #!/bin/bash
-# Residual TD3 on Aloha Sim transfer cube.
+# Residual TD3 on Aloha Sim transfer cube with simulated base-policy inference delay.
 
 export MUJOCO_GL=egl
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,9 +27,11 @@ python -m resfit.rl_finetuning.scripts.train_residual_td3 \
     agent.actor_lr=0.0001 \
     agent.critic_lr=0.0003 \
     agent.actor.action_scale=0.1 \
+    base_policy.inference_delay=20 \
+    base_policy.n_action_steps=25 \
     eval_num_episodes=50 \
     wandb.project=aloha-transfer-cube-residual-td3 \
-    wandb.name=residual-rl-aloha-as0.1-updated \
-    wandb.notes="aloha/transfer_cube residual TD3" \
+    wandb.name=residual-rl-aloha-as0.1-updated-delay20-n25 \
+    wandb.notes="aloha/transfer_cube residual TD3 with inference delay 20 and n_action_steps 25" \
     wandb.group=residual-rl \
     debug=false

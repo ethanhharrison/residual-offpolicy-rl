@@ -242,6 +242,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         openpi_checkpoint=cfg.base_policy.openpi_checkpoint,
     )
     base_policy.eval()
+    if cfg.base_policy.n_action_steps is not None:
+        base_policy.config.n_action_steps = cfg.base_policy.n_action_steps
     if cfg.base_policy.type == "pi0":
         # Reuse the loaded OpenPI model but keep a separate action-chunk queue for eval.
         from resfit.lerobot.policies.pi0.modeling_openpi_pi0_aloha_sim import OpenPIPi0AlohaSimPolicy
@@ -257,6 +259,8 @@ def main(cfg: ResidualTD3DexmgConfig):
             openpi_config_name=cfg.base_policy.openpi_config_name,
             openpi_checkpoint=cfg.base_policy.openpi_checkpoint,
         )
+    if cfg.base_policy.n_action_steps is not None:
+        eval_base_policy.config.n_action_steps = cfg.base_policy.n_action_steps
     eval_base_policy.eval()
 
     # Extract the configuration from base policy
@@ -323,6 +327,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             action_scaler=action_scaler,
             state_standardizer=state_standardizer,
             language_instruction=language_instruction,
+            inference_delay=cfg.base_policy.inference_delay,
         )
 
     # ---------------------------------------------------------------------
@@ -474,6 +479,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         "use_base_policy_for_warmup": cfg.algo.use_base_policy_for_warmup,
         "warmup_pure_base_policy": cfg.algo.warmup_pure_base_policy,
         "warmup_min_success_episodes": cfg.algo.warmup_min_success_episodes,
+        "base_policy_inference_delay": cfg.base_policy.inference_delay,
+        "base_policy_n_action_steps": base_policy.config.n_action_steps,
         # Normalization parameters for consistency
         "min_action_range": cfg.offline_data.min_action_range,
         "min_state_std": cfg.offline_data.min_state_std,
@@ -711,6 +718,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         "base_policy_wandb_id": cfg.base_policy.wandb_id,
         "base_policy_openpi_checkpoint": cfg.base_policy.openpi_checkpoint,
         "base_policy_language_instruction": cfg.base_policy.language_instruction,
+        "base_policy_inference_delay": cfg.base_policy.inference_delay,
+        "base_policy_n_action_steps": base_policy.config.n_action_steps,
         "sampling_strategy": cfg.algo.sampling_strategy,
         "normalized_actions": True,
         "batch_size": offline_batch_size,
