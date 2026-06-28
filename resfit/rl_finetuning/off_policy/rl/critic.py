@@ -247,11 +247,61 @@ class C51Loss(nn.Module):
         return losses.mean()  # Average over all heads and batch
 
 
+class PropMLPQEnsemble(nn.Module):
+    """Q-head ensemble that consumes proprioception and actions directly (no visual trunk)."""
+
+    def __init__(
+        self,
+        *,
+        prop_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        orth: int,
+        output_dim: int = 1,
+        num_heads: int = 2,
+        num_layers: int = 2,
+        use_layer_norm: bool = True,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        input_dim = prop_dim + action_dim
+
+        heads = [HeadMLP(input_dim, hidden_dim, output_dim, num_layers, use_layer_norm) for _ in range(num_heads)]
+        self.params, self.buffers = stack_module_state(heads)
+        self._head_template = HeadMLP(input_dim, hidden_dim, output_dim, num_layers, use_layer_norm)
+
+        for name, param in self.params.items():
+            self.register_parameter(f"_vmap_param_{name.replace('.', '_')}", nn.Parameter(param))
+        for name, buffer in self.buffers.items():
+            self.register_buffer(f"_vmap_buffer_{name.replace('.', '_')}", buffer)
+
+        if orth:
+            with torch.no_grad():
+                for key, param in self.params.items():
+                    if "weight" in key and param.dim() >= 2:
+                        for h in range(self.num_heads):
+                            if param[h].dim() >= 2:
+                                utils.orth_weight_init(param[h])
+
+    def forward(self, feat: torch.Tensor, prop: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        del feat
+        z = torch.cat([prop, action], dim=-1)
+
+        current_params = {name: getattr(self, f"_vmap_param_{name.replace('.', '_')}") for name in self.params}
+        current_buffers = {name: getattr(self, f"_vmap_buffer_{name.replace('.', '_')}") for name in self.buffers}
+
+        def f_one_head(p, b, z_input):
+            return functional_call(self._head_template, (p, b), (z_input,))
+
+        return vmap(f_one_head, in_dims=(0, 0, None))(current_params, current_buffers, z)
+
+
 class Critic(nn.Module):
     def __init__(self, repr_dim, patch_repr_dim, prop_dim, action_dim, cfg: CriticConfig):
         super().__init__()
         self.cfg = cfg
         self.loss_cfg = cfg.loss
+        self.use_visual_trunk = repr_dim > 0
 
         if self.loss_cfg.type in {"hl_gauss", "c51"}:
             output_dim = self.loss_cfg.n_bins
@@ -261,21 +311,32 @@ class Critic(nn.Module):
         # Number of Q-heads (ensemble size)
         num_q = getattr(cfg, "num_q", 2)
 
-        # Build an ensemble that shares the spatial trunk and owns K independent heads
-        self.q_ensemble = SpatialEmbQEnsemble(
-            fuse_patch=cfg.fuse_patch,
-            num_patch=repr_dim // patch_repr_dim,
-            patch_dim=patch_repr_dim,
-            emb_dim=cfg.spatial_emb,
-            prop_dim=prop_dim,
-            action_dim=action_dim,
-            hidden_dim=self.cfg.hidden_dim,
-            orth=self.cfg.orth,
-            output_dim=output_dim,
-            num_heads=num_q,
-            num_layers=cfg.num_layers,
-            use_layer_norm=cfg.use_layer_norm,
-        )
+        if self.use_visual_trunk:
+            self.q_ensemble = SpatialEmbQEnsemble(
+                fuse_patch=cfg.fuse_patch,
+                num_patch=repr_dim // patch_repr_dim,
+                patch_dim=patch_repr_dim,
+                emb_dim=cfg.spatial_emb,
+                prop_dim=prop_dim,
+                action_dim=action_dim,
+                hidden_dim=self.cfg.hidden_dim,
+                orth=self.cfg.orth,
+                output_dim=output_dim,
+                num_heads=num_q,
+                num_layers=cfg.num_layers,
+                use_layer_norm=cfg.use_layer_norm,
+            )
+        else:
+            self.q_ensemble = PropMLPQEnsemble(
+                prop_dim=prop_dim,
+                action_dim=action_dim,
+                hidden_dim=self.cfg.hidden_dim,
+                orth=self.cfg.orth,
+                output_dim=output_dim,
+                num_heads=num_q,
+                num_layers=cfg.num_layers,
+                use_layer_norm=cfg.use_layer_norm,
+            )
 
         # Loss objects (single instance) ----
         if self.loss_cfg.type == "hl_gauss":

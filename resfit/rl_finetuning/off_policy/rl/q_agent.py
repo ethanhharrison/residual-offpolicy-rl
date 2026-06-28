@@ -52,7 +52,12 @@ class QAgent(nn.Module):
         # Normalise *rl_cameras* to a list for unified processing
         if isinstance(rl_cameras, str):
             rl_cameras = [rl_cameras]
-        assert len(rl_cameras) > 0, "At least one camera must be provided"
+        self.no_encoder = cfg.enc_type == "none"
+        if self.no_encoder:
+            assert len(rl_cameras) == 0, "enc_type='none' requires empty rl_cameras"
+            assert cfg.use_prop, "enc_type='none' requires use_prop=1 so state reaches actor/critic"
+        else:
+            assert len(rl_cameras) > 0, "At least one camera must be provided"
 
         self.rl_cameras = rl_cameras
         self.cfg = cfg
@@ -62,14 +67,14 @@ class QAgent(nn.Module):
         # that the helper function can iterate over them.
         self.encoders: nn.ModuleList = self._build_encoders(obs_shape)
 
-        # All encoders share the same architecture ⇒ repr / patch dim are identical.
-        sample_encoder = self.encoders[0]
-        repr_dim_single = int(sample_encoder.repr_dim)  # type: ignore[attr-defined]
-        patch_repr_dim = int(sample_encoder.patch_repr_dim)  # type: ignore[attr-defined]
-
-        # Concatenate the patch dimension from every camera (dim=1) → overall
-        # representation dimension scales linearly with #cameras.
-        repr_dim = repr_dim_single * len(self.rl_cameras)
+        if self.no_encoder:
+            repr_dim = 0
+            patch_repr_dim = 1
+        else:
+            sample_encoder = self.encoders[0]
+            repr_dim_single = int(sample_encoder.repr_dim)  # type: ignore[attr-defined]
+            patch_repr_dim = int(sample_encoder.patch_repr_dim)  # type: ignore[attr-defined]
+            repr_dim = repr_dim_single * len(self.rl_cameras)
         print("encoder output dim: ", repr_dim)
         print("patch output dim: ", patch_repr_dim)
 
@@ -109,7 +114,10 @@ class QAgent(nn.Module):
             print("🧊 Encoder parameters frozen - no gradient updates will be performed")
 
         # Create optimizers (PyTorch will ignore frozen parameters)
-        self.encoder_opt = torch.optim.AdamW(self.encoders.parameters(), lr=self.cfg.critic_lr)
+        if self.no_encoder or not any(p.requires_grad for p in self.encoders.parameters()):
+            self.encoder_opt = None
+        else:
+            self.encoder_opt = torch.optim.AdamW(self.encoders.parameters(), lr=self.cfg.critic_lr)
         self.critic_opt = torch.optim.AdamW(self.critic.parameters(), lr=self.cfg.critic_lr)
         self.actor_opt = torch.optim.AdamW(self.actor.parameters(), lr=self.cfg.actor_lr)
 
@@ -131,9 +139,10 @@ class QAgent(nn.Module):
             actor_start_factor = max(actor_start_factor, 1e-8)
 
             # Create schedulers with appropriate start factors
-            self.encoder_scheduler = torch.optim.lr_scheduler.LinearLR(
-                self.encoder_opt, start_factor=critic_start_factor, total_iters=self.cfg.lr_warmup_steps
-            )
+            if self.encoder_opt is not None:
+                self.encoder_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    self.encoder_opt, start_factor=critic_start_factor, total_iters=self.cfg.lr_warmup_steps
+                )
             self.critic_scheduler = torch.optim.lr_scheduler.LinearLR(
                 self.critic_opt, start_factor=critic_start_factor, total_iters=self.cfg.lr_warmup_steps
             )
@@ -160,6 +169,9 @@ class QAgent(nn.Module):
         """
 
         encoders = nn.ModuleList()
+
+        if self.cfg.enc_type == "none":
+            return encoders
 
         for _ in self.rl_cameras:
             if self.cfg.enc_type == "vit":
@@ -220,6 +232,15 @@ class QAgent(nn.Module):
         direct env observations during evaluation) we assume it is properly
         normalised.
         """
+        if self.no_encoder:
+            return torch.empty(
+                obs["observation.state"].shape[0],
+                0,
+                1,
+                device=obs["observation.state"].device,
+                dtype=obs["observation.state"].dtype,
+            )
+
         feats = []
         for cam_idx, cam_name in enumerate(self.rl_cameras):
             data = obs[cam_name]
@@ -253,9 +274,10 @@ class QAgent(nn.Module):
         return feat_all  # noqa: RET504
 
     def _maybe_unsqueeze_(self, obs):
-        should_unsqueeze = False
-        if obs[self.rl_cameras[0]].dim() == 3:
-            should_unsqueeze = True
+        if self.no_encoder:
+            should_unsqueeze = obs["observation.state"].dim() == 1
+        else:
+            should_unsqueeze = obs[self.rl_cameras[0]].dim() == 3
 
         if should_unsqueeze:
             for k, v in obs.items():
@@ -441,20 +463,27 @@ class QAgent(nn.Module):
             metrics["train/importance_weights_max"] = importance_weights.max().item()
 
         # Zero gradients
-        self.encoder_opt.zero_grad(set_to_none=True)
+        if self.encoder_opt is not None:
+            self.encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
 
         critic_loss.backward(retain_graph=True)
 
         # Gradient clipping
-        encoder_grad_norm = torch.nn.utils.clip_grad_norm_(self.encoders.parameters(), self.cfg.critic_grad_clip_norm)
+        if self.no_encoder:
+            encoder_grad_norm = torch.tensor(0.0)
+        else:
+            encoder_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.encoders.parameters(), self.cfg.critic_grad_clip_norm
+            )
         critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.cfg.critic_grad_clip_norm)
 
         # Store gradient norms for logging
         metrics["train/encoder_grad_norm"] = encoder_grad_norm.item()
         metrics["train/critic_grad_norm"] = critic_grad_norm.item()
 
-        self.encoder_opt.step()
+        if self.encoder_opt is not None:
+            self.encoder_opt.step()
         self.critic_opt.step()
 
         return metrics
@@ -610,7 +639,7 @@ class QAgent(nn.Module):
         loss = actor_loss_total + (self.cfg.bc_loss_coef * ratio * bc_loss).mean()
         self.actor_opt.zero_grad(set_to_none=True)
         # Conditionally update encoder along with actor if BC loss should backprop
-        if bc_backprop_encoder:
+        if bc_backprop_encoder and self.encoder_opt is not None:
             self.encoder_opt.zero_grad(set_to_none=True)
 
         loss.backward()
@@ -620,12 +649,12 @@ class QAgent(nn.Module):
             self.actor.parameters(), self.cfg.actor_grad_clip_norm
         ).item()
 
-        if bc_backprop_encoder:
+        if bc_backprop_encoder and self.encoder_opt is not None:
             metrics["train/encoder_grad_norm"] = torch.nn.utils.clip_grad_norm_(
                 self.encoders.parameters(), self.cfg.actor_grad_clip_norm
             ).item()
 
-        if bc_backprop_encoder:
+        if bc_backprop_encoder and self.encoder_opt is not None:
             self.encoder_opt.step()
         self.actor_opt.step()
 

@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 
 from hydra.core.config_store import ConfigStore
 
-from resfit.rl_finetuning.config.rlpd import ActorConfig, QAgentConfig, RLPDAlgoConfig, RLPDDexmgConfig
+from resfit.kinetix.constants import default_bc_checkpoint
+from resfit.rl_finetuning.config.rlpd import ActorConfig, CriticConfig, QAgentConfig, RLPDAlgoConfig, RLPDDexmgConfig
 
 
 @dataclass
@@ -35,7 +36,8 @@ class WandBConfig:
 
 @dataclass
 class BasePolicyConfig:
-    # "act" loads from W&B; "pi0" loads from OpenPI's public S3 checkpoints.
+    # "act" loads from W&B; "pi0" loads from OpenPI's public S3 checkpoints;
+    # "kinetix_flow" loads rtc-kinetix flow policies from GCS/local pickle files.
     type: str = "act"
     wandb_id: str = "TODO"
     wt_type: str = "best"
@@ -45,6 +47,8 @@ class BasePolicyConfig:
     language_instruction: str | None = None
     inference_delay: int = 0
     n_action_steps: int | None = None
+    kinetix_checkpoint: str | None = None
+    num_flow_steps: int = 5
 
 
 @dataclass
@@ -94,7 +98,7 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
 @dataclass
 class ResidualTD3DexmgConfig(RLPDDexmgConfig):
     actor_name: str | None = None  # Inferred from base policy config
-    env_type: str = "dexmg"  # "dexmg" or "aloha"
+    env_type: str = "dexmg"  # "dexmg", "aloha", or "kinetix"
     camera_size: int | None = None
 
     # ------------------------------------------------------------------
@@ -339,6 +343,74 @@ class ResidualTD3AlohaTransferCubeConfig(ResidualTD3DexmgConfig):
     eval_num_episodes: int = 10
 
 
+@dataclass
+class ResidualTD3KinetixMjcSwimmerConfig(ResidualTD3DexmgConfig):
+    env_type: str = "kinetix"
+    task: str = "mjc_swimmer"
+    video_key: str = "observation.state"
+    rl_camera: list[str] = field(default_factory=list)
+    offline_data: OfflineDataConfig | None = None
+    algo: ResidualTD3AlgoConfig = field(
+        default_factory=lambda: ResidualTD3AlgoConfig(
+            total_timesteps=500_000,
+            offline_fraction=0.0,
+            critic_warmup_steps=10_000,
+            random_action_noise_scale=0.2,
+            use_base_policy_for_warmup=True,
+            stddev_max=0.05,
+            stddev_min=0.05,
+        )
+    )
+    base_policy: BasePolicyConfig = field(
+        default_factory=lambda: BasePolicyConfig(
+            type="kinetix_flow",
+            kinetix_checkpoint=default_bc_checkpoint("mjc_swimmer"),
+            n_action_steps=1,
+            num_flow_steps=5,
+        )
+    )
+    agent: QAgentConfig = field(
+        default_factory=lambda: QAgentConfig(
+            enc_type="none",
+            actor_lr=1e-4,
+            critic_lr=1e-4,
+            critic_target_tau=0.005,
+            actor=ActorConfig(action_scale=0.1, actor_last_layer_init_scale=0.0, hidden_dim=256),
+            critic=CriticConfig(hidden_dim=256),
+        )
+    )
+    wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="kinetix-mjc-swimmer-residual-td3"))
+    eval_num_envs: int = 1
+
+
+@dataclass
+class ResidualTD3KinetixMjcWalkerConfig(ResidualTD3KinetixMjcSwimmerConfig):
+    task: str = "mjc_walker"
+    base_policy: BasePolicyConfig = field(
+        default_factory=lambda: BasePolicyConfig(
+            type="kinetix_flow",
+            kinetix_checkpoint=default_bc_checkpoint("mjc_walker"),
+            n_action_steps=1,
+            num_flow_steps=5,
+        )
+    )
+    wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="kinetix-mjc-walker-residual-td3"))
+
+
+@dataclass
+class ResidualTD3KinetixCarLaunchConfig(ResidualTD3KinetixMjcSwimmerConfig):
+    task: str = "car_launch"
+    base_policy: BasePolicyConfig = field(
+        default_factory=lambda: BasePolicyConfig(
+            type="kinetix_flow",
+            kinetix_checkpoint=default_bc_checkpoint("car_launch"),
+            n_action_steps=1,
+            num_flow_steps=5,
+        )
+    )
+    wandb: WandBConfig = field(default_factory=lambda: WandBConfig(project="kinetix-car-launch-residual-td3"))
+
+
 # -----------------------------------------------------------------------------
 # Register with Hydra
 # -----------------------------------------------------------------------------
@@ -350,3 +422,6 @@ cs.store(name="residual_td3_box_clean_config", node=ResidualTD3BoxCleanConfig)
 cs.store(name="residual_td3_coffee_config", node=ResidualTD3CoffeeConfig)
 cs.store(name="residual_td3_two_arm_cansort_config", node=ResidualTD3TwoArmCanSortConfig)
 cs.store(name="residual_td3_aloha_transfer_cube_config", node=ResidualTD3AlohaTransferCubeConfig)
+cs.store(name="residual_td3_kinetix_mjc_swimmer_config", node=ResidualTD3KinetixMjcSwimmerConfig)
+cs.store(name="residual_td3_kinetix_mjc_walker_config", node=ResidualTD3KinetixMjcWalkerConfig)
+cs.store(name="residual_td3_kinetix_car_launch_config", node=ResidualTD3KinetixCarLaunchConfig)

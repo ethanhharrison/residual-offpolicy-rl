@@ -52,6 +52,7 @@ from resfit.rl_finetuning.off_policy.rl.q_agent import QAgent
 from resfit.rl_finetuning.utils.dtype import maybe_resize_rl_images, to_uint8
 from resfit.rl_finetuning.utils.env_factory import create_vectorized_env
 from resfit.rl_finetuning.utils.evaluate_dexmg import run_dexmg_evaluation
+from resfit.rl_finetuning.utils.evaluate_kinetix import run_kinetix_evaluation
 from resfit.rl_finetuning.utils.hugging_face import (
     _hf_download_buffer,
     _hf_upload_buffer,
@@ -228,10 +229,43 @@ def main(cfg: ResidualTD3DexmgConfig):
         torch.backends.cudnn.allow_tf32 = True
 
     # ---------------------------------------------------------------------
+    # Seeding (must be done before environment / base policy probing) -----
+    # ---------------------------------------------------------------------
+    if cfg.seed is None:
+        cfg.seed = random.randint(0, 2**32 - 1)
+
+    # Comprehensive seeding for reproducibility
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+
+    # CUDA seeding for multi-GPU reproducibility
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    # Set deterministic behavior
+    torch.backends.cudnn.deterministic = cfg.torch_deterministic
+    
+    print(f"Set random seed to {cfg.seed}")
+
+    # ---------------------------------------------------------------------
     # Load the behaviour-cloning policy that will serve as the "base" policy
     # for residual learning.
     # ---------------------------------------------------------------------
     assert "base_policy" in cfg, "Base policy configuration is required"
+    is_kinetix = cfg.env_type == "kinetix"
+    kinetix_obs_dim = None
+    kinetix_action_dim = None
+    if is_kinetix:
+        from resfit.kinetix.environments.kinetix_env import KinetixGymWrapper
+        from resfit.kinetix.utils.deps import log_jax_devices
+
+        probe_env = KinetixGymWrapper(cfg.task, seed=cfg.seed)
+        kinetix_obs_dim = probe_env.observation_space["observation.state"].shape[0]
+        kinetix_action_dim = probe_env.action_space.shape[0]
+        probe_env.close()
+        log_jax_devices("Kinetix environment")
+
     base_policy: PreTrainedPolicy = load_base_policy(
         policy_type=cfg.base_policy.type,
         device=device,
@@ -240,7 +274,16 @@ def main(cfg: ResidualTD3DexmgConfig):
         wt_version=cfg.base_policy.wt_version,
         openpi_config_name=cfg.base_policy.openpi_config_name,
         openpi_checkpoint=cfg.base_policy.openpi_checkpoint,
+        kinetix_checkpoint=cfg.base_policy.kinetix_checkpoint,
+        kinetix_obs_dim=kinetix_obs_dim,
+        kinetix_action_dim=kinetix_action_dim,
+        kinetix_n_action_steps=cfg.base_policy.n_action_steps or 1,
+        kinetix_num_flow_steps=cfg.base_policy.num_flow_steps,
     )
+    if is_kinetix:
+        from resfit.kinetix.utils.deps import log_jax_devices
+
+        log_jax_devices("Kinetix base policy")
     base_policy.eval()
     if cfg.base_policy.n_action_steps is not None:
         base_policy.config.n_action_steps = cfg.base_policy.n_action_steps
@@ -248,6 +291,11 @@ def main(cfg: ResidualTD3DexmgConfig):
         # Reuse the loaded OpenPI model but keep a separate action-chunk queue for eval.
         from resfit.lerobot.policies.pi0.modeling_openpi_pi0_aloha_sim import OpenPIPi0AlohaSimPolicy
         eval_base_policy = OpenPIPi0AlohaSimPolicy(base_policy._openpi_policy, base_policy.config)
+        eval_base_policy.to(device)
+    elif cfg.base_policy.type == "kinetix_flow":
+        from resfit.kinetix.policies.kinetix_flow_policy import KinetixFlowPolicy
+
+        eval_base_policy = KinetixFlowPolicy(base_policy.config, base_policy._flow_policy)
         eval_base_policy.to(device)
     else:
         eval_base_policy = load_base_policy(
@@ -258,6 +306,11 @@ def main(cfg: ResidualTD3DexmgConfig):
             wt_version=cfg.base_policy.wt_version,
             openpi_config_name=cfg.base_policy.openpi_config_name,
             openpi_checkpoint=cfg.base_policy.openpi_checkpoint,
+            kinetix_checkpoint=cfg.base_policy.kinetix_checkpoint,
+            kinetix_obs_dim=kinetix_obs_dim,
+            kinetix_action_dim=kinetix_action_dim,
+            kinetix_n_action_steps=cfg.base_policy.n_action_steps or 1,
+            kinetix_num_flow_steps=cfg.base_policy.num_flow_steps,
         )
     if cfg.base_policy.n_action_steps is not None:
         eval_base_policy.config.n_action_steps = cfg.base_policy.n_action_steps
@@ -270,6 +323,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         cfg.actor_name = "residual_act"
     elif isinstance(base_cfg, PI0Config):
         cfg.actor_name = "residual_pi0"
+    elif cfg.base_policy.type == "kinetix_flow":
+        cfg.actor_name = "residual_kinetix_flow"
     else:
         raise ValueError(f"Unknown base policy type: {type(base_cfg)}")
 
@@ -279,20 +334,29 @@ def main(cfg: ResidualTD3DexmgConfig):
 
     # Load dataset and get normalization functions early
     print("Loading dataset and setting up normalization...")
-    dataset = LeRobotDataset(cfg.offline_data.name, video_backend=_resolve_video_backend())
+    min_action_range = cfg.offline_data.min_action_range if cfg.offline_data is not None else 1e-1
+    min_state_std = cfg.offline_data.min_state_std if cfg.offline_data is not None else 1e-1
+    if is_kinetix:
+        from resfit.kinetix.utils.normalization import kinetix_dataset_stats
+
+        dataset_stats = kinetix_dataset_stats(kinetix_obs_dim, kinetix_action_dim)
+        dataset = None
+    else:
+        dataset = LeRobotDataset(cfg.offline_data.name, video_backend=_resolve_video_backend())
+        dataset_stats = dataset.meta.stats
 
     # Create action scaler from dataset statistics
     action_scaler = ActionScaler.from_dataset_stats(
-        action_stats=dataset.meta.stats["action"],
+        action_stats=dataset_stats["action"],
         action_scale=cfg.agent.actor.action_scale,
-        min_range_per_dim=cfg.offline_data.min_action_range,
+        min_range_per_dim=min_action_range,
         device=device,
     )
 
     # Create state standardizer from dataset statistics
     state_standardizer = StateStandardizer.from_dataset_stats(
-        state_stats=dataset.meta.stats["observation.state"],
-        min_std=cfg.offline_data.min_state_std,
+        state_stats=dataset_stats["observation.state"],
+        min_std=min_state_std,
         device=device,
     )
 
@@ -318,6 +382,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             camera_size=cfg.camera_size,
             video_key=video_key,
             debug=debug,
+            seed=cfg.seed,
         )
 
         # Wrap it with the base policy wrapper
@@ -329,26 +394,6 @@ def main(cfg: ResidualTD3DexmgConfig):
             language_instruction=language_instruction,
             inference_delay=cfg.base_policy.inference_delay,
         )
-
-    # ---------------------------------------------------------------------
-    # Seeding (must be done before environment creation) ------------------
-    # ---------------------------------------------------------------------
-    if cfg.seed is None:
-        cfg.seed = random.randint(0, 2**32 - 1)
-
-    # Comprehensive seeding for reproducibility
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-
-    # CUDA seeding for multi-GPU reproducibility
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.seed)
-
-    # Set deterministic behavior
-    torch.backends.cudnn.deterministic = cfg.torch_deterministic
-
-    print(f"Set random seed to {cfg.seed}")
 
     # ---------------------------------------------------------------------
     # Environment setup ----------------------------------------------------
@@ -392,29 +437,35 @@ def main(cfg: ResidualTD3DexmgConfig):
     # configuration can specify either a single camera name (str) or a list of
     # names.
     if isinstance(cfg.rl_camera, str):
-        image_keys: list[str] = [cfg.rl_camera]
-    else:
+        image_keys: list[str] = [cfg.rl_camera] if cfg.rl_camera else []
+    elif cfg.rl_camera:
         image_keys = list(cfg.rl_camera)
-    assert isinstance(image_keys, list)
+    else:
+        image_keys = []
+    assert is_kinetix or isinstance(image_keys, list) and len(image_keys) > 0, "At least one camera is required"
     lowdim_dim = env.observation_space["observation.state"].shape[1]
-    img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]
     action_dim = env.action_space.shape[1]
 
-    lowdim_keys = ["observation.state", "observation.base_action"]
-
-    # ViT encoder expects 84x84; Aloha Sim renders 480x640 for the pi0 base policy.
-    rl_image_size = cfg.camera_size or 84
-    if img_h != rl_image_size or img_w != rl_image_size:
-        print(
-            f"RL encoder uses {rl_image_size}x{rl_image_size} images "
-            f"(env camera: {img_h}x{img_w}, base policy keeps full resolution)"
-        )
+    if image_keys:
+        img_c, img_h, img_w = env.observation_space[image_keys[0]].shape[1:]
+        rl_image_size = cfg.camera_size or 84
+        if img_h != rl_image_size or img_w != rl_image_size:
+            print(
+                f"RL encoder uses {rl_image_size}x{rl_image_size} images "
+                f"(env camera: {img_h}x{img_w}, base policy keeps full resolution)"
+            )
+        obs_shape = (img_c, rl_image_size, rl_image_size)
+    else:
+        rl_image_size = None
+        obs_shape = (0, 0, 0)
 
     # ---------------------------------------------------------------------
     # Networks ------------------------------------------------------------
     # ---------------------------------------------------------------------
+    lowdim_keys = ["observation.state", "observation.base_action"]
+
     agent = QAgent(
-        obs_shape=(img_c, rl_image_size, rl_image_size),
+        obs_shape=obs_shape,
         prop_shape=(lowdim_dim,),
         action_dim=action_dim,
         rl_cameras=image_keys,
@@ -482,8 +533,8 @@ def main(cfg: ResidualTD3DexmgConfig):
         "base_policy_inference_delay": cfg.base_policy.inference_delay,
         "base_policy_n_action_steps": base_policy.config.n_action_steps,
         # Normalization parameters for consistency
-        "min_action_range": cfg.offline_data.min_action_range,
-        "min_state_std": cfg.offline_data.min_state_std,
+        "min_action_range": min_action_range,
+        "min_state_std": min_state_std,
         "normalized_actions": True,
         # Library versions for compatibility
         "torchrl_version": torchrl.__version__,
@@ -516,39 +567,39 @@ def main(cfg: ResidualTD3DexmgConfig):
         print(f"Loaded online buffer from cache at {online_cache_dir} (size={len(online_rb)})")
 
     # Offline data is required for normalization, but can be unused for training if offline_fraction=0
-    assert cfg.offline_data is not None and cfg.offline_data.num_episodes is not None
-
-    # Dataset and normalization already loaded above - use existing dataset
-
-    # Use actual dataset metadata for precise buffer sizing
-    if cfg.offline_data.num_episodes is not None:
-        # Only use subset of episodes if specified
-        total_frames = sum(
-            dataset.meta.episodes[ep_idx]["length"]
-            for ep_idx in range(min(cfg.offline_data.num_episodes, dataset.meta.total_episodes))
-        )
-        num_episodes = cfg.offline_data.num_episodes
+    if is_kinetix:
+        max_offline_transitions = 1
+        print("Kinetix online-only mode: creating minimal offline buffer (unused)")
     else:
-        # Use entire dataset
-        total_frames = dataset.meta.total_frames
-        num_episodes = dataset.meta.total_episodes
+        assert cfg.offline_data is not None and cfg.offline_data.num_episodes is not None
 
-    # Calculate transitions: each episode contributes (episode_length - 1) transitions
-    estimated_transitions = max(0, total_frames - num_episodes)
+        # Use actual dataset metadata for precise buffer sizing
+        if cfg.offline_data.num_episodes is not None:
+            total_frames = sum(
+                dataset.meta.episodes[ep_idx]["length"]
+                for ep_idx in range(min(cfg.offline_data.num_episodes, dataset.meta.total_episodes))
+            )
+            num_episodes = cfg.offline_data.num_episodes
+        else:
+            total_frames = dataset.meta.total_frames
+            num_episodes = dataset.meta.total_episodes
 
-    print("Dataset buffer sizing:")
-    print(f"  Total frames to process: {total_frames}")
-    print(f"  Number of episodes: {num_episodes}")
-    print(f"  Estimated transitions: {estimated_transitions}")
+        # Calculate transitions: each episode contributes (episode_length - 1) transitions
+        estimated_transitions = max(0, total_frames - num_episodes)
 
-    # Calculate buffer size for simplified approach (1 transition per frame pair)
-    max_offline_transitions = (
-        estimated_transitions if cfg.algo.offline_fraction > 0.0 else 1
-    )  # Minimum size for online-only mode
-    if cfg.algo.offline_fraction > 0.0:
-        print(f"Offline buffer sized for GT-as-base approach: {max_offline_transitions} transitions")
-    else:
-        print("Online-only mode: creating minimal offline buffer (unused)")
+        print("Dataset buffer sizing:")
+        print(f"  Total frames to process: {total_frames}")
+        print(f"  Number of episodes: {num_episodes}")
+        print(f"  Estimated transitions: {estimated_transitions}")
+
+        # Calculate buffer size for simplified approach (1 transition per frame pair)
+        max_offline_transitions = (
+            estimated_transitions if cfg.algo.offline_fraction > 0.0 else 1
+        )  # Minimum size for online-only mode
+        if cfg.algo.offline_fraction > 0.0:
+            print(f"Offline buffer sized for GT-as-base approach: {max_offline_transitions} transitions")
+        else:
+            print("Online-only mode: creating minimal offline buffer (unused)")
 
     offline_rb = TensorDictPrioritizedReplayBuffer(
         storage=LazyTensorStorage(max_size=max_offline_transitions, device="cpu"),
@@ -705,11 +756,11 @@ def main(cfg: ResidualTD3DexmgConfig):
     # Build a metadata dictionary that uniquely identifies the buffer
     offline_cache_meta = {
         "task": cfg.task,
-        "dataset_name": cfg.offline_data.name,
-        "num_episodes": cfg.offline_data.num_episodes,
-        "use_base_policy_for_base_actions": cfg.offline_data.use_base_policy_for_base_actions,
-        "min_action_range": cfg.offline_data.min_action_range,
-        "min_state_std": cfg.offline_data.min_state_std,
+        "dataset_name": cfg.offline_data.name if cfg.offline_data is not None else None,
+        "num_episodes": cfg.offline_data.num_episodes if cfg.offline_data is not None else None,
+        "use_base_policy_for_base_actions": cfg.offline_data.use_base_policy_for_base_actions if cfg.offline_data is not None else False,
+        "min_action_range": min_action_range,
+        "min_state_std": min_state_std,
         "image_keys": image_keys,
         "camera_size": cfg.camera_size,
         "n_step": cfg.algo.n_step,
@@ -717,6 +768,7 @@ def main(cfg: ResidualTD3DexmgConfig):
         "base_policy_type": cfg.base_policy.type,
         "base_policy_wandb_id": cfg.base_policy.wandb_id,
         "base_policy_openpi_checkpoint": cfg.base_policy.openpi_checkpoint,
+        "base_policy_kinetix_checkpoint": cfg.base_policy.kinetix_checkpoint,
         "base_policy_language_instruction": cfg.base_policy.language_instruction,
         "base_policy_inference_delay": cfg.base_policy.inference_delay,
         "base_policy_n_action_steps": base_policy.config.n_action_steps,
@@ -760,7 +812,7 @@ def main(cfg: ResidualTD3DexmgConfig):
             loaded_from_cache = True
             print(f"Loaded offline buffer from cache at {cache_dir} (size={len(offline_rb)})")
 
-        if not loaded_from_cache:
+        if not loaded_from_cache and not is_kinetix:
             added = _populate_offline_buffer(
                 dataset=dataset,
                 rb=offline_rb,
@@ -783,7 +835,7 @@ def main(cfg: ResidualTD3DexmgConfig):
 
             if OFFLINE_HF_REPO is not None:
                 _hf_upload_buffer(OFFLINE_HF_REPO, cache_dir, cache_hash)
-        else:
+        elif loaded_from_cache:
             added = len(offline_rb)
     else:
         print("Skipping offline buffer population for online-only training")
@@ -1099,17 +1151,30 @@ def main(cfg: ResidualTD3DexmgConfig):
         # ------------------------------------------------------------------
         if global_step % cfg.eval_interval_every_steps == 0 and (cfg.eval_first or global_step > 0):
             with training_timer.time("evaluation"):
-                eval_metrics = run_dexmg_evaluation(
-                    env=eval_env,
-                    agent=agent,
-                    num_episodes=cfg.eval_num_episodes,
-                    device=device,
-                    global_step=global_step,
-                    save_video=cfg.save_video,
-                    save_q_plots=cfg.save_video,  # Enable Q-plots when video saving is enabled
-                    run_name=run_name,
-                    output_dir=outputs_dir,
-                )
+                if is_kinetix:
+                    eval_metrics = run_kinetix_evaluation(
+                        env=eval_env,
+                        agent=agent,
+                        num_episodes=cfg.eval_num_episodes,
+                        device=device,
+                        global_step=global_step,
+                        save_video=cfg.save_video,
+                        save_q_plots=cfg.save_video,
+                        run_name=run_name,
+                        output_dir=outputs_dir,
+                    )
+                else:
+                    eval_metrics = run_dexmg_evaluation(
+                        env=eval_env,
+                        agent=agent,
+                        num_episodes=cfg.eval_num_episodes,
+                        device=device,
+                        global_step=global_step,
+                        save_video=cfg.save_video,
+                        save_q_plots=cfg.save_video,
+                        run_name=run_name,
+                        output_dir=outputs_dir,
+                    )
 
                 # Handle model saving when success rate improves
                 current_success_rate = eval_metrics["eval/success_rate"]

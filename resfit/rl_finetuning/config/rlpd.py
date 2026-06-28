@@ -119,7 +119,7 @@ class QAgentConfig:
     lr_warmup_start: float = 1e-8  # Starting LR for warmup (very small positive value)
     # encoder
     use_prop: int = 1
-    enc_type: str = "vit"  # "vit" or "conv"
+    enc_type: str = "vit"  # "vit", "conv", or "none"
     vit: VitEncoderConfig = field(default_factory=lambda: VitEncoderConfig())
     conv: ConvEncoderConfig = field(default_factory=lambda: ConvEncoderConfig())
     # critic & actor
@@ -144,7 +144,7 @@ class QAgentConfig:
     target_action_noise: bool = True  # Whether to add noise to target actions in TD3
 
     def __post_init__(self):
-        assert self.enc_type in {"vit", "conv"}, f"Unknown encoder type: {self.enc_type}"
+        assert self.enc_type in {"vit", "conv", "none"}, f"Unknown encoder type: {self.enc_type}"
 
 
 # -----------------------------------------------------------------------------

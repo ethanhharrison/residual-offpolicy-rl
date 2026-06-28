@@ -192,6 +192,9 @@ class BasePolicyVecEnvWrapper:
             device = next(iter(infer_obs.values())).device if infer_obs else self.base_policy._device
             return torch.stack([torch.as_tensor(action, dtype=torch.float32, device=device) for action in action_chunk], dim=0)
 
+        if self.base_policy.config.type == "kinetix_flow":
+            return self.base_policy.predict_action_chunk(infer_obs, chunk_length)
+
         batch = self.base_policy.normalize_inputs(infer_obs)
         if self.base_policy.config.image_features:
             batch = dict(batch)

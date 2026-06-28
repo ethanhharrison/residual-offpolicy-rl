@@ -72,13 +72,15 @@ class Actor(nn.Module):
         self.prop_dim = prop_dim
         self.residual_actor = residual_actor
         self.cfg = cfg
+        self.use_encoder = repr_dim > 0
 
         if residual_actor:
             # The residual actor takes the base action as input alongside the state
             self.prop_dim += action_dim
 
         if cfg.spatial_emb > 0:
-            assert cfg.spatial_emb > 1, "this is the dimension"
+            assert self.use_encoder, "spatial_emb requires a visual encoder"
+            assert not self.residual_actor, "Not implemented"
             self.compress = SpatialEmb(
                 num_patch=repr_dim // patch_repr_dim,
                 patch_dim=patch_repr_dim,
@@ -88,7 +90,7 @@ class Actor(nn.Module):
                 use_layer_norm=cfg.use_layer_norm,
             )
             policy_in_dim = cfg.spatial_emb
-        else:
+        elif self.use_encoder:
             layers = [nn.Linear(repr_dim, cfg.feature_dim)]
             if cfg.use_layer_norm:
                 layers.append(nn.LayerNorm(cfg.feature_dim))
@@ -96,6 +98,9 @@ class Actor(nn.Module):
 
             self.compress = nn.Sequential(*layers)
             policy_in_dim = cfg.feature_dim
+        else:
+            self.compress = None
+            policy_in_dim = 0
 
         if self.prop_dim > 0:
             policy_in_dim += self.prop_dim
@@ -122,12 +127,11 @@ class Actor(nn.Module):
             intermediate_init = "orthogonal"
 
         # Initialize compression layers
-        if cfg.orth:
-            # Backward compatibility: use existing orthogonal initialization
-            self.compress.apply(utils.orth_weight_init)
-        else:
-            # Use the specified distribution for compression layers
-            utils.apply_initialization_to_network(self.compress, intermediate_init)
+        if self.compress is not None:
+            if cfg.orth:
+                self.compress.apply(utils.orth_weight_init)
+            else:
+                utils.apply_initialization_to_network(self.compress, intermediate_init)
 
         # Initialize policy network intermediate layers (exclude final layer)
         utils.apply_initialization_to_network(self.policy, intermediate_init, exclude_final_layer=True)
@@ -148,14 +152,16 @@ class Actor(nn.Module):
                 )
 
     def forward(self, obs: dict[str, torch.Tensor], std: float):
-        if isinstance(self.compress, SpatialEmb):
-            assert not self.residual_actor, "Not implemented"
-            feat = self.compress.forward(obs["feat"], obs["observation.state"])
-        else:
-            feat = obs["feat"].flatten(1, -1)
-            feat = self.compress(feat)
+        all_input = []
+        if self.compress is not None:
+            if isinstance(self.compress, SpatialEmb):
+                feat = self.compress.forward(obs["feat"], obs["observation.state"])
+                all_input.append(feat)
+            else:
+                feat = obs["feat"].flatten(1, -1)
+                feat = self.compress(feat)
+                all_input.append(feat)
 
-        all_input = [feat]
         if self.prop_dim > 0:
             prop = obs["observation.state"]
             all_input.append(prop)

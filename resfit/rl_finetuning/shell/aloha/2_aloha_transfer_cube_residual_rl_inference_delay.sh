@@ -17,8 +17,8 @@ python -m resfit.rl_finetuning.scripts.train_residual_td3 \
     algo.use_base_policy_for_warmup=true \
     algo.warmup_pure_base_policy=true \
     algo.warmup_min_success_episodes=1 \
-    algo.stddev_min=0.003 \
-    algo.stddev_max=0.003 \
+    algo.stddev_min=0.002 \
+    algo.stddev_max=0.002 \
     agent.enc_type=conv \
     agent.actor.hidden_dim=128 \
     agent.actor.num_layers=2 \
@@ -26,7 +26,7 @@ python -m resfit.rl_finetuning.scripts.train_residual_td3 \
     agent.critic.num_layers=2 \
     agent.actor_lr=0.0001 \
     agent.critic_lr=0.0003 \
-    agent.actor.action_scale=0.1 \
+    agent.actor.action_scale=0.05 \
     base_policy.inference_delay=20 \
     base_policy.n_action_steps=25 \
     eval_num_episodes=50 \

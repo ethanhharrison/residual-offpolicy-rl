@@ -23,7 +23,7 @@ OPENPI_PALIGEMMA_TOKENIZER_GS = "gs://big_vision/paligemma_tokenizer.model"
 OPENPI_PALIGEMMA_TOKENIZER_HTTPS = (
     "https://storage.googleapis.com/big_vision/paligemma_tokenizer.model"
 )
-BasePolicyType = Literal["act", "pi0"]
+BasePolicyType = Literal["act", "pi0", "kinetix_flow"]
 
 
 def _patch_openpi_restore_params() -> None:
@@ -217,6 +217,25 @@ def load_policy(policy_dir: Path) -> ACTPolicy:
     raise ValueError(f"Unknown policy type: {policy_name_field}")
 
 
+def load_kinetix_flow_policy(
+    *,
+    checkpoint_path: str,
+    obs_dim: int,
+    action_dim: int,
+    n_action_steps: int = 1,
+    num_flow_steps: int = 5,
+):
+    from resfit.kinetix.policies.kinetix_flow_policy import KinetixFlowPolicy
+
+    return KinetixFlowPolicy.from_checkpoint(
+        checkpoint_path=checkpoint_path,
+        obs_dim=obs_dim,
+        action_dim=action_dim,
+        n_action_steps=n_action_steps,
+        num_flow_steps=num_flow_steps,
+    )
+
+
 def load_base_policy(
     *,
     policy_type: BasePolicyType,
@@ -226,8 +245,23 @@ def load_base_policy(
     wt_version: str = "latest",
     openpi_config_name: str = "pi0_aloha_sim",
     openpi_checkpoint: str = OPENPI_PI0_ALOHA_SIM_CHECKPOINT,
+    kinetix_checkpoint: str | None = None,
+    kinetix_obs_dim: int | None = None,
+    kinetix_action_dim: int | None = None,
+    kinetix_n_action_steps: int = 1,
+    kinetix_num_flow_steps: int = 5,
 ) -> PreTrainedPolicy:
     """Load the configured base policy for residual RL."""
+    if policy_type == "kinetix_flow":
+        policy = load_kinetix_flow_policy(
+            checkpoint_path=kinetix_checkpoint,
+            obs_dim=kinetix_obs_dim,
+            action_dim=kinetix_action_dim,
+            n_action_steps=kinetix_n_action_steps,
+            num_flow_steps=kinetix_num_flow_steps,
+        )
+        return policy.to(device)
+
     if policy_type == "pi0":
         policy = load_openpi_pi0_policy(
             openpi_config_name=openpi_config_name,
