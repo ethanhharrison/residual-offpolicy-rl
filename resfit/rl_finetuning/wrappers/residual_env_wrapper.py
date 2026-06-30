@@ -42,6 +42,7 @@ class BasePolicyVecEnvWrapper:
         state_standardizer,
         language_instruction: str | None = None,
         inference_delay: int = 0,
+        zero_base_action_in_env: bool = False,
     ):
         """
         Args:
@@ -72,6 +73,7 @@ class BasePolicyVecEnvWrapper:
         self.state_standardizer = state_standardizer
         self.language_instruction = language_instruction
         self.inference_delay = inference_delay
+        self.zero_base_action_in_env = zero_base_action_in_env
         self.requires_language = getattr(base_policy.config, "type", "") == "pi0"
 
         # Get action dimension from the environment
@@ -89,6 +91,15 @@ class BasePolicyVecEnvWrapper:
     @property
     def num_envs(self):
         return self.vec_env.num_envs
+
+    def set_zero_base_action_in_env(self, enabled: bool) -> None:
+        """Toggle whether base-policy actions are zeroed for env steps and observations."""
+        self.zero_base_action_in_env = enabled
+
+    def _effective_base_naction(self, base_naction: torch.Tensor) -> torch.Tensor:
+        if not self.zero_base_action_in_env:
+            return base_naction
+        return torch.zeros_like(base_naction)
 
     def _init_delay_state(self):
         self._obs_history = [[] for _ in range(self.num_envs)]
@@ -249,9 +260,10 @@ class BasePolicyVecEnvWrapper:
         base_action = self._select_base_action(raw_obs)
 
         base_naction = self.action_scaler.scale(base_action)
+        effective_base_naction = self._effective_base_naction(base_naction)
 
         # Augment observations with base action and apply state standardization
-        augmented_obs = self._augment_obs(raw_obs, base_naction)
+        augmented_obs = self._augment_obs(raw_obs, effective_base_naction)
 
         # Store for later use in step
         self._last_base_naction = base_naction
@@ -280,7 +292,7 @@ class BasePolicyVecEnvWrapper:
         # we use the normalized actions as the action space
         # The normalized base action is stored as [-1, 1] in the replay buffer
         # and the residual action is predicted as action_scale * [-1, 1]
-        combined_naction = self._last_base_naction + residual_naction
+        combined_naction = self._effective_base_naction(self._last_base_naction) + residual_naction
 
         # Unscale back to original action space for environment execution
         env_action = self.action_scaler.unscale(combined_naction)
@@ -310,9 +322,10 @@ class BasePolicyVecEnvWrapper:
         base_action = self._select_base_action(raw_obs)
 
         base_naction = self.action_scaler.scale(base_action)
+        effective_base_naction = self._effective_base_naction(base_naction)
 
         # Augment observations with base action and apply state standardization
-        augmented_obs = self._augment_obs(raw_obs, base_naction)
+        augmented_obs = self._augment_obs(raw_obs, effective_base_naction)
 
         # Handle final_obs in info dict to ensure consistent shapes
         if "final_obs" in info:

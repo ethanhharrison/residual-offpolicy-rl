@@ -76,9 +76,14 @@ class ResidualTD3AlgoConfig(RLPDAlgoConfig):
     # (zero residual) during warmup instead of base + random_action_noise_scale.
     warmup_pure_base_policy: bool = False
 
-    # Keep collecting warmup episodes until at least this many successes are logged,
+    # Keep collecting warmup episodes until at least this number of successes are logged,
     # even if learning_starts transitions are already in the buffer.
     warmup_min_success_episodes: int = 0
+
+    # After warmup, zero out base-policy actions for environment execution and
+    # observations so only the residual policy drives rollouts. Warmup still uses
+    # the full base + residual action composition when populating the online buffer.
+    zero_base_action_in_env: bool = False
 
     # ------------------------------------------------------------------
     # Standard deviation schedule -------------------------------------------

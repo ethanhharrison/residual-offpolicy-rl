@@ -1005,6 +1005,14 @@ def main(cfg: ResidualTD3DexmgConfig):
     model_save_dir.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
+    if cfg.algo.zero_base_action_in_env:
+        env.set_zero_base_action_in_env(True)
+        eval_env.set_zero_base_action_in_env(True)
+        print(
+            "Zero base action in env enabled: training/eval rollouts use residual-only actions "
+            "(warmup buffer collected with full base + residual actions)."
+        )
+
     obs, _ = env.reset()
 
     global_step = 0

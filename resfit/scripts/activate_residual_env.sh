@@ -22,6 +22,14 @@ export PATH="${ENV_PATH}/bin:${PATH}"
 export PYTHONPATH="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="${ENV_PATH}/lib:${LD_LIBRARY_PATH:-}"
 
+# OpenPI (Aloha pi0) and Kinetix flow base policies use JAX with cuda12 wheels.
+# Without CUDA_ROOT, jax import can fail with a partially initialized module error.
+JAX_ENV="${SCRIPT_DIR}/../kinetix/jax_cuda_env.sh"
+if [ -f "${JAX_ENV}" ]; then
+    # shellcheck disable=SC1091
+    source "${JAX_ENV}"
+fi
+
 # uv-managed Python on HPC often lacks system CA certs; gcsfs/HTTPS need certifi.
 if python -c "import certifi" >/dev/null 2>&1; then
     export SSL_CERT_FILE="$(python -c "import certifi; print(certifi.where())")"

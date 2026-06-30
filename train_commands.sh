@@ -1,7 +1,12 @@
-# bash resfit/rl_finetuning/shell/aloha/2_aloha_transfer_cube_residual_rl_inference_delay.sh
 # bash resfit/rl_finetuning/shell/aloha/1_aloha_transfer_cube_residual_rl.sh
-# bash resfit/rl_finetuning/shell/kinetix/4_kinetix_mjc_swimmer_residual_rl_inference_delay.sh
+bash resfit/rl_finetuning/shell/aloha/2_aloha_transfer_cube_residual_rl_inference_delay.sh
+
+# bash resfit/rl_finetuning/shell/kinetix/1_kinetix_mjc_swimmer_residual_rl.sh
 # bash resfit/rl_finetuning/shell/kinetix/2_kinetix_mjc_walker_residual_rl.sh
-# bash resfit/rl_finetuning/shell/kinetix/5_kinetix_mjc_walker_residual_rl_inference_delay.sh
-bash resfit/rl_finetuning/shell/kinetix/6_kinetix_car_launch_residual_rl_inference_delay.sh
 # bash resfit/rl_finetuning/shell/kinetix/3_kinetix_car_launch_residual_rl.sh
+# bash resfit/rl_finetuning/shell/kinetix/4_kinetix_mjc_swimmer_residual_rl_inference_delay.sh
+# bash resfit/rl_finetuning/shell/kinetix/5_kinetix_mjc_walker_residual_rl_inference_delay.sh
+# bash resfit/rl_finetuning/shell/kinetix/6_kinetix_car_launch_residual_rl_inference_delay.sh
+# bash resfit/rl_finetuning/shell/kinetix/7_kinetix_mjc_swimmer_residual_rl_inference_delay_zero_base.sh
+# bash resfit/rl_finetuning/shell/kinetix/8_kinetix_mjc_walker_residual_rl_inference_delay_zero_base.sh
+# bash resfit/rl_finetuning/shell/kinetix/9_kinetix_car_launch_residual_rl_inference_delay_zero_base.sh

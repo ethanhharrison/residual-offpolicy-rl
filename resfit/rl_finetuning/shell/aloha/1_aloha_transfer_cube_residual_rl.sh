@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 source "$REPO_ROOT/scripts/activate_residual_env.sh"
 source "$REPO_ROOT/scripts/scratch_env.sh"
+# shellcheck disable=SC1091
+source "$REPO_ROOT/kinetix/jax_cuda_env.sh"
 
 python -m resfit.rl_finetuning.scripts.train_residual_td3 \
     --config-name=residual_td3_aloha_transfer_cube_config \
